@@ -1,0 +1,262 @@
+# name: test/sql/sem_ops_llm.test
+# description: The semantic operators against the mock OpenAI-compatible server (test/mock_openai_server.py)
+# group: [sql]
+
+# Run with: python3 test/mock_openai_server.py 8765 &
+#           SEM_OPS_MOCK_API=http://127.0.0.1:8765/v1/ ./build/release/test/unittest test/sql/sem_ops_llm.test
+require-env SEM_OPS_MOCK_API
+
+require sem_ops
+
+# the grammar is activated at the first query boundary after the extension is loaded
+query I
+SELECT current_setting('active_grammar_extensions');
+----
+[sem_ops]
+
+statement ok
+CREATE LLM MODEL mock PATH 'gpt-mock' ON PROMPT API '{SEM_OPS_MOCK_API}';
+
+statement ok
+CREATE EMBED MODEL embedder PATH 'embed-mock' API '{SEM_OPS_MOCK_API}';
+
+statement ok
+CREATE TABLE reviews AS SELECT * FROM (VALUES
+    (1, 'good food', 'a'),
+    (2, 'bad service', 'a'),
+    (3, 'good food', 'b'),
+    (4, NULL, 'b')) t(id, review, category);
+
+# scalar LLM expressions, one output column of each supported type
+query IIIII
+SELECT id,
+       LLM mock PROMPT 'what is the {sentiment VARCHAR} of {{review}}',
+       LLM mock PROMPT 'how {long INTEGER} is {{review}}',
+       LLM mock PROMPT 'what is {half DOUBLE} of {{reviews.review}}',
+       LLM mock PROMPT 'is {{review}} {positive BOOLEAN}'
+FROM reviews ORDER BY id;
+----
+1	GOOD FOOD	9	4.5	true
+2	BAD SERVICE	11	5.5	false
+3	GOOD FOOD	9	4.5	true
+4	NULL	4	2.0	false
+
+query I
+SELECT id FROM reviews WHERE LLM mock PROMPT 'is {{review}} {positive BOOLEAN}' ORDER BY id;
+----
+1
+3
+
+# the model name is optional
+query II
+SELECT id, LLM 'what is the {sentiment VARCHAR} of {{review}}' FROM reviews WHERE id = 2;
+----
+2	BAD SERVICE
+
+# batching: rows with identical inputs are sent once, the others are batched into one call
+query II
+SELECT id, LLM mock PROMPT 'rows in the call {batch_info INTEGER} for {{review}}' FROM reviews ORDER BY id;
+----
+1	3
+2	3
+3	3
+4	3
+
+statement ok
+SET llm_use_cache = false;
+
+query II
+SELECT id, LLM mock PROMPT 'rows in the call {batch_info INTEGER} for {{review}}' FROM reviews ORDER BY id;
+----
+1	4
+2	4
+3	4
+4	4
+
+statement ok
+SET ml_batch_size = 1;
+
+query II
+SELECT id, LLM mock PROMPT 'rows in the call {batch_info INTEGER} for {{review}}' FROM reviews ORDER BY id;
+----
+1	1
+2	1
+3	1
+4	1
+
+statement ok
+SET llm_use_batch = false;
+
+query II
+SELECT id, LLM mock PROMPT 'what is the {sentiment VARCHAR} of {{review}}' FROM reviews ORDER BY id;
+----
+1	GOOD FOOD
+2	BAD SERVICE
+3	GOOD FOOD
+4	NULL
+
+statement ok
+RESET llm_use_batch;
+
+statement ok
+RESET ml_batch_size;
+
+statement ok
+RESET llm_use_cache;
+
+# per-model OPTIONS override the settings
+statement ok
+CREATE LLM MODEL small_batches PATH 'gpt-mock' ON PROMPT API '{SEM_OPS_MOCK_API}' OPTIONS {batch_size: 2, n_threads: 1};
+
+query II
+SELECT id, LLM small_batches PROMPT 'rows in the call {batch_info INTEGER} for {{id}}' FROM reviews ORDER BY id;
+----
+1	2
+2	2
+3	2
+4	2
+
+# invalid batched answers fall back to one call per row
+statement ok
+CREATE LLM MODEL bad_batches PATH 'mock-bad-batch' ON PROMPT API '{SEM_OPS_MOCK_API}';
+
+query II
+SELECT id, LLM bad_batches PROMPT 'what is the {sentiment VARCHAR} of {{review}}' FROM reviews ORDER BY id;
+----
+1	GOOD FOOD
+2	BAD SERVICE
+3	GOOD FOOD
+4	NULL
+
+# table form with an input relation
+query IIIIII
+SELECT * FROM LLM mock (PROMPT 'extract {upper VARCHAR} and {len INTEGER} and {good BOOLEAN} from {{review}}' ON reviews)
+ORDER BY id;
+----
+1	good food	a	GOOD FOOD	9	true
+2	bad service	a	BAD SERVICE	11	false
+3	good food	b	GOOD FOOD	9	true
+4	NULL	b	NULL	4	false
+
+query II
+SELECT r.id, r.upper FROM LLM (PROMPT 'extract {upper VARCHAR} from {{review}}' ON (SELECT * FROM reviews WHERE id < 3)) AS r
+ORDER BY r.id;
+----
+1	GOOD FOOD
+2	BAD SERVICE
+
+query II
+SELECT id, x FROM PREDICT(mock, PROMPT 'the {x VARCHAR} of {{category}}', reviews) ORDER BY id;
+----
+1	A
+2	A
+3	B
+4	B
+
+# without placeholders, every input column is sent
+query II
+SELECT id, c FROM LLM mock (PROMPT 'the {c VARCHAR}' ON (SELECT id FROM reviews)) ORDER BY id;
+----
+1	1
+2	2
+3	3
+4	4
+
+# table generation without an input relation
+query II
+SELECT * FROM LLM mock PROMPT 'get all the {state VARCHAR} and their {state_tax DOUBLE}' ORDER BY state;
+----
+ALPHA	2.5
+BETA	2.0
+GOOD	2.0
+
+query I
+SELECT st FROM LLM 'get all the {state VARCHAR}' AS s(st) WHERE st LIKE 'B%';
+----
+BETA
+
+# aggregates: one call per group over all non-NULL inputs
+query II
+SELECT category, AGG LLM mock (PROMPT 'summarize the {summary VARCHAR} of {{review}}') FROM reviews
+GROUP BY category ORDER BY category;
+----
+a	2 rows: bad service, good food
+b	1 rows: good food
+
+query I
+SELECT AGG LLM (PROMPT 'summarize the {summary VARCHAR} of {{review}} and {{category}}') FROM reviews;
+----
+3 rows: bad service, good food, good food
+
+# semantic join: one call decides all pairs of a chunk
+statement ok
+CREATE TABLE cpus AS SELECT * FROM (VALUES ('i7'), ('ryzen'), ('m1')) t(cpu);
+
+statement ok
+CREATE TABLE boards AS SELECT * FROM (VALUES ('RYZEN'), ('i7'), ('arm')) t(board);
+
+query II
+SELECT cpu, board FROM cpus JOIN boards ON LLM mock PROMPT 'is CPU {{cpus.cpu}} {compatible BOOLEAN} with {{boards.board}}'
+ORDER BY ALL;
+----
+i7	i7
+ryzen	RYZEN
+
+# embeddings
+query IIII
+SELECT id, len(vec), vec[1], vec[2] FROM EMBED embedder(COLUMN review, reviews) ORDER BY id;
+----
+1	384	9.0	0.40234375
+2	384	11.0	0.3828125
+3	384	9.0	0.40234375
+4	NULL	NULL	NULL
+
+query I
+SELECT typeof(vec) FROM EMBED embedder(COLUMN review, reviews) LIMIT 1;
+----
+FLOAT[384]
+
+# the bearer token of the model's secret is sent
+statement ok
+CREATE SECRET mock_key (TYPE http, BEARER_TOKEN 'sk-test');
+
+statement ok
+CREATE SECRET wrong_key (TYPE http, BEARER_TOKEN 'sk-wrong');
+
+statement ok
+CREATE LLM MODEL authed PATH 'mock-auth' ON PROMPT API '{SEM_OPS_MOCK_API}' SECRET mock_key;
+
+statement ok
+CREATE LLM MODEL unauthorized PATH 'mock-auth' ON PROMPT API '{SEM_OPS_MOCK_API}' SECRET wrong_key;
+
+query I
+SELECT LLM authed PROMPT 'the {x VARCHAR} of {{review}}' FROM reviews WHERE id = 1;
+----
+GOOD FOOD
+
+statement error
+SELECT LLM unauthorized PROMPT 'the {x VARCHAR} of {{review}}' FROM reviews WHERE id = 1;
+----
+failed with 401
+
+# API errors that retrying cannot fix are raised
+statement ok
+CREATE LLM MODEL missing PATH 'mock-missing' ON PROMPT API '{SEM_OPS_MOCK_API}';
+
+statement error
+SELECT LLM missing PROMPT 'the {x VARCHAR} of {{review}}' FROM reviews;
+----
+failed with 404
+
+statement error
+SELECT * FROM LLM missing PROMPT 'get all the {state VARCHAR}';
+----
+failed with 404
+
+statement ok
+CREATE LLM MODEL unreachable PATH 'gpt-mock' ON PROMPT API 'http://127.0.0.1:1/v1/';
+
+statement error
+SELECT LLM unreachable PROMPT 'the {x VARCHAR} of {{review}}' FROM reviews;
+----
+Connection error

@@ -1,0 +1,300 @@
+# name: test/sql/sem_ops.test
+# description: Model DDL, grammar and binding of the semantic operators (no LLM calls)
+# group: [sql]
+
+# Before we load the extension, the syntax and functions do not exist
+statement error
+SELECT * FROM sem_ops_models();
+----
+Catalog Error: Table Function with name sem_ops_models does not exist!
+
+require sem_ops
+
+query I
+SELECT current_setting('active_grammar_extensions');
+----
+[sem_ops]
+
+query IIIIII
+SELECT current_setting('ml_batch_size'), current_setting('llm_use_batch'), current_setting('llm_use_cache'),
+       current_setting('llm_no_threads'), current_setting('llm_timeout'), current_setting('model_select_strategy');
+----
+16	true	true	16	120	first
+
+statement error
+SET model_select_strategy = 'optimal';
+----
+Unsupported model_select_strategy "optimal"
+
+query I
+SELECT count(*) FROM sem_ops_models();
+----
+0
+
+# CREATE MODEL
+statement ok
+CREATE LLM MODEL gpt PATH 'gpt-4o-mini' ON PROMPT API 'https://api.openai.com/v1/'
+    OPTIONS {"req_per_min": 30, batch_size: 4, use_cache: false};
+
+statement ok
+CREATE EMBED MODEL embedder PATH 'text-embedding-3-small';
+
+query IIIIIII
+SELECT * FROM sem_ops_models() ORDER BY name;
+----
+embedder	EMBED	text-embedding-3-small	NULL	NULL	{}	false
+gpt	LLM	gpt-4o-mini	https://api.openai.com/v1/	NULL	{req_per_min=30, batch_size=4, use_cache=false}	false
+
+statement error
+CREATE LLM MODEL gpt PATH 'other' ON PROMPT;
+----
+Model with name "gpt" already exists
+
+statement error
+CREATE LLM MODEL GPT PATH 'other' ON PROMPT;
+----
+Model with name "GPT" already exists
+
+statement ok
+CREATE LLM MODEL IF NOT EXISTS gpt PATH 'other' ON PROMPT;
+
+query I
+SELECT model_path FROM sem_ops_models() WHERE name = 'gpt';
+----
+gpt-4o-mini
+
+statement ok
+CREATE OR REPLACE LLM MODEL gpt PATH 'gpt-4.1' ON PROMPT;
+
+query II
+SELECT model_path, options FROM sem_ops_models() WHERE name = 'gpt';
+----
+gpt-4.1	{}
+
+# temporary models shadow persistent ones
+statement ok
+CREATE TEMP LLM MODEL gpt PATH 'temp-model' ON PROMPT;
+
+query III
+SELECT name, model_path, temporary FROM sem_ops_models() ORDER BY name, temporary;
+----
+embedder	text-embedding-3-small	false
+gpt	gpt-4.1	false
+gpt	temp-model	true
+
+statement ok
+DROP MODEL gpt;
+
+query III
+SELECT name, model_path, temporary FROM sem_ops_models() ORDER BY name;
+----
+embedder	text-embedding-3-small	false
+gpt	gpt-4.1	false
+
+statement ok
+DROP MODEL gpt;
+
+statement error
+DROP MODEL gpt;
+----
+Model with name "gpt" does not exist
+
+statement ok
+DROP MODEL IF EXISTS gpt;
+
+# model DDL is transactional
+statement ok
+BEGIN;
+
+statement ok
+CREATE LLM MODEL rolled_back PATH 'x' ON PROMPT;
+
+query I
+SELECT count(*) FROM sem_ops_models() WHERE name = 'rolled_back';
+----
+1
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM sem_ops_models() WHERE name = 'rolled_back';
+----
+0
+
+# secrets must exist when the model is created
+statement error
+CREATE LLM MODEL secret_model PATH 'x' ON PROMPT SECRET missing_secret;
+----
+Secret "missing_secret" for the API of model "secret_model" does not exist
+
+statement ok
+CREATE SECRET openai_key (TYPE http, BEARER_TOKEN 'sk-test');
+
+statement ok
+CREATE LLM MODEL secret_model PATH 'x' ON PROMPT SECRET openai_key;
+
+query I
+SELECT secret FROM sem_ops_models() WHERE name = 'secret_model';
+----
+openai_key
+
+# invalid model definitions
+statement error
+CREATE LLM MODEL bad PATH 'x';
+----
+CREATE LLM MODEL requires ON PROMPT
+
+statement error
+CREATE EMBED MODEL bad PATH 'x' ON PROMPT;
+----
+CREATE EMBED MODEL does not accept ON PROMPT
+
+statement error
+CREATE LLM MODEL bad PATH '/models/gemma-2-2b-it.gguf' ON PROMPT;
+----
+Local .gguf models are not supported
+
+statement error
+CREATE LLM MODEL bad PATH 'x' ON PROMPT API 'localhost:8080';
+----
+must be an http:// or https:// URL
+
+statement error
+CREATE OR REPLACE LLM MODEL IF NOT EXISTS bad PATH 'x' ON PROMPT;
+----
+Cannot specify both OR REPLACE and IF NOT EXISTS
+
+statement error
+CREATE LLM MODEL bad PATH 'x' ON PROMPT OPTIONS {batch_size: 1 + 1};
+----
+Model OPTIONS must be constants
+
+# binding: model resolution, placeholders and model types
+statement ok
+CREATE LLM MODEL llm PATH 'gpt-4o-mini' ON PROMPT;
+
+statement ok
+CREATE TABLE reviews (id INTEGER, review VARCHAR);
+
+statement error
+SELECT LLM nope PROMPT 'is it {good BOOLEAN}: {{review}}' FROM reviews;
+----
+Model with name "nope" does not exist
+
+statement error
+SELECT LLM llm PROMPT 'no output placeholder {{review}}' FROM reviews;
+----
+the prompt must declare exactly one output column {name TYPE}, found 0
+
+statement error
+SELECT LLM llm PROMPT '{a VARCHAR} {b VARCHAR} {{review}}' FROM reviews;
+----
+Scalar LLM expressions support only one output column
+
+statement error
+SELECT LLM llm PROMPT '{a VARCHAR} {{missing_column}}' FROM reviews;
+----
+missing_column
+
+statement error
+SELECT * FROM LLM llm (PROMPT '{a VARCHAR} {{missing_column}}' ON reviews);
+----
+the input relation has no column "missing_column" referenced by the prompt
+
+statement error
+SELECT * FROM LLM llm (PROMPT '{a VARCHAR} {{reviews.review}}' ON reviews);
+----
+the prompt cannot reference qualified columns
+
+statement error
+SELECT * FROM LLM llm (PROMPT 'no output {{review}}' ON reviews);
+----
+the prompt must declare at least one output column
+
+statement error
+SELECT * FROM LLM llm PROMPT '{a VARCHAR} {{review}}';
+----
+the prompt cannot reference input columns
+
+statement error
+SELECT * FROM EMBED llm(COLUMN review, reviews);
+----
+Model "llm" is an LLM model, but an EMBED model is required here
+
+statement error
+SELECT * FROM EMBED embedder(COLUMN missing_column, reviews);
+----
+the input relation has no column "missing_column"
+
+statement error
+SELECT AGG LLM llm (PROMPT '{summary VARCHAR} of nothing') FROM reviews;
+----
+AGG LLM requires the prompt to reference at least one input column
+
+# the operators bind without calling the model
+statement ok
+EXPLAIN SELECT id, LLM llm PROMPT 'what is the {sentiment VARCHAR} of {{review}}' FROM reviews;
+
+statement ok
+EXPLAIN SELECT * FROM LLM llm (PROMPT 'extract the {genre VARCHAR} from {{review}}' ON reviews) AS r WHERE r.genre = 'x';
+
+statement ok
+EXPLAIN SELECT * FROM PREDICT(llm, PROMPT 'extract the {genre VARCHAR} from {{review}}', reviews);
+
+statement ok
+EXPLAIN SELECT * FROM LLM llm PROMPT 'get all {state VARCHAR} and their {state_tax DOUBLE}';
+
+statement ok
+EXPLAIN SELECT * FROM LLM 'get all {state VARCHAR}' AS s(name);
+
+statement ok
+EXPLAIN SELECT id, AGG LLM llm (PROMPT 'summarize the {summary VARCHAR} of {{review}}') FROM reviews GROUP BY id;
+
+statement ok
+EXPLAIN SELECT * FROM EMBED embedder(COLUMN review, reviews);
+
+statement ok
+EXPLAIN SELECT * FROM reviews r1 JOIN reviews r2 ON LLM 'are {{r1.review}} and {{r2.review}} {same BOOLEAN}';
+
+# the output placeholder names the column
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT LLM llm PROMPT 'what is the {sentiment VARCHAR} of {{review}}' FROM reviews);
+----
+sentiment	VARCHAR
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM LLM llm (PROMPT '{n INTEGER} {x DOUBLE} {ok BOOLEAN} {{review}}' ON reviews));
+----
+id	INTEGER
+review	VARCHAR
+n	INTEGER
+x	DOUBLE
+ok	BOOLEAN
+
+# model selection without a model name only considers LLM models
+statement ok
+DROP MODEL llm;
+
+statement ok
+DROP MODEL secret_model;
+
+statement error
+SELECT LLM 'is it {good BOOLEAN}: {{review}}' FROM reviews;
+----
+No LLM models available for model selection
+
+# identifiers that match the new keywords keep working
+statement ok
+CREATE TABLE keywords (llm INTEGER, prompt VARCHAR, model VARCHAR, embed INTEGER, agg INTEGER, predict INTEGER);
+
+statement ok
+INSERT INTO keywords VALUES (1, 'p', 'm', 2, 3, 4);
+
+query IIIIII
+SELECT llm, prompt, model, embed, agg, predict FROM keywords;
+----
+1	p	m	2	3	4
+
+statement ok
+DROP TABLE keywords;
